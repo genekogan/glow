@@ -26,11 +26,20 @@ async def main():
         print("\n🚀 Running minimal SDK test...\n")
 
         async for message in query(prompt="Say hello in one word.", options=options):
-            print(f"Message type: {message.type}")
-            if hasattr(message, 'event'):
-                print(f"  Event: {message.event}")
-            if hasattr(message, 'result'):
-                print(f"  Result: {message.result}")
+            # Print the message class and its attributes
+            msg_type = type(message).__name__
+            print(f"Message: {msg_type}")
+
+            # Try to access common attributes
+            for attr in ['type', 'subtype', 'event', 'result', 'content', 'text', 'data']:
+                if hasattr(message, attr):
+                    val = getattr(message, attr)
+                    if val is not None:
+                        # Truncate long values
+                        val_str = str(val)
+                        if len(val_str) > 200:
+                            val_str = val_str[:200] + "..."
+                        print(f"  .{attr} = {val_str}")
 
         print("\n✅ Done!")
 
