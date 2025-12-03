@@ -293,112 +293,104 @@ class AgentClient:
                 # Check for cancellation
                 cancel_token.check()
 
-                match message.type:
-                    case "stream_event":
-                        event = message.event
-                        event_type = event.get("type")
+                msg_type = type(message).__name__
 
-                        if event_type == "message_start":
-                            turn += 1
-                            session.turns = turn
-                            yield {"type": "turn_start", "turn": turn}
+                if msg_type == "SystemMessage":
+                    # System messages: init, compact_boundary, etc.
+                    subtype = getattr(message, 'subtype', None)
+                    data = getattr(message, 'data', {})
 
-                            evt = Event(type=EventType.TURN_START, turn=turn)
-                            session.add_event(evt)
-                            if on_event:
-                                on_event(evt)
+                    if subtype == "init":
+                        # Session initialized
+                        if 'session_id' in data:
+                            session.anthropic_session_id = data['session_id']
+                        turn += 1
+                        session.turns = turn
+                        yield {"type": "turn_start", "turn": turn}
 
-                        elif event_type == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = delta.get("text", "")
-                                current_text += text
-                                yield {"type": "text", "text": text}
+                        evt = Event(type=EventType.TURN_START, turn=turn)
+                        session.add_event(evt)
+                        if on_event:
+                            on_event(evt)
 
-                        elif event_type == "content_block_start":
-                            block = event.get("content_block", {})
-                            if block.get("type") == "tool_use":
-                                tool_call = ToolCall(
-                                    tool_use_id=block.get("id"),
-                                    name=block.get("name"),
-                                )
-                                current_tool_calls.append(tool_call)
-                                yield {
-                                    "type": "tool_start",
-                                    "name": tool_call.name,
-                                    "id": tool_call.tool_use_id,
-                                }
-
-                                evt = Event(
-                                    type=EventType.TOOL_START,
-                                    turn=turn,
-                                    tool_call_id=tool_call.id,
-                                    data={"name": tool_call.name},
-                                )
-                                session.add_event(evt)
-                                if on_event:
-                                    on_event(evt)
-
-                    case "result":
-                        # Update session with result
-                        session.anthropic_session_id = message.session_id
-                        session.update_usage(
-                            input_tokens=message.usage.input_tokens,
-                            output_tokens=message.usage.output_tokens,
-                            cost_usd=message.total_cost_usd,
+                    elif subtype == "compact_boundary":
+                        trigger = data.get("trigger", "auto")
+                        evt = Event(
+                            type=EventType.COMPACTION,
+                            data={"trigger": trigger},
                         )
+                        session.add_event(evt)
+                        if on_event:
+                            on_event(evt)
+                        yield {"type": "compaction", "trigger": trigger}
 
-                        # Create assistant message
-                        assistant_msg = Message(
-                            role=MessageRole.ASSISTANT,
-                            content=current_text or message.result,
-                            tool_calls=current_tool_calls,
-                            input_tokens=message.usage.input_tokens,
-                            output_tokens=message.usage.output_tokens,
-                            model=settings.agent.model,
-                        )
-                        session.add_message(assistant_msg)
-                        await self.storage.append_message(session.id, assistant_msg)
+                elif msg_type == "AssistantMessage":
+                    # Assistant response with content
+                    content = getattr(message, 'content', [])
+                    for block in content:
+                        block_type = type(block).__name__
+                        if block_type == "TextBlock":
+                            text = getattr(block, 'text', '')
+                            current_text += text
+                            yield {"type": "text", "text": text}
+                        elif block_type == "ToolUseBlock":
+                            tool_call = ToolCall(
+                                tool_use_id=getattr(block, 'id', ''),
+                                name=getattr(block, 'name', ''),
+                                input=getattr(block, 'input', {}),
+                            )
+                            current_tool_calls.append(tool_call)
+                            yield {
+                                "type": "tool_start",
+                                "name": tool_call.name,
+                                "id": tool_call.tool_use_id,
+                            }
 
-                        # Complete session
-                        session.complete(SessionStatus.COMPLETED)
-                        await self.storage.update_session(session)
-
-                        log.info(
-                            "agent_completed",
-                            turns=message.num_turns,
-                            cost_usd=message.total_cost_usd,
-                            input_tokens=message.usage.input_tokens,
-                            output_tokens=message.usage.output_tokens,
-                        )
-
-                        # End Langfuse generation
-                        generation.end(
-                            output=message.result,
-                            usage={
-                                "input": message.usage.input_tokens,
-                                "output": message.usage.output_tokens,
-                            },
-                        )
-
-                        yield {
-                            "type": "done",
-                            "response": message.result,
-                            "session": session,
-                            "turns": message.num_turns,
-                            "cost_usd": message.total_cost_usd,
-                        }
-
-                    case "system":
-                        if message.subtype == "compact_boundary":
                             evt = Event(
-                                type=EventType.COMPACTION,
-                                data={"trigger": message.trigger},
+                                type=EventType.TOOL_START,
+                                turn=turn,
+                                tool_call_id=tool_call.id,
+                                data={"name": tool_call.name},
                             )
                             session.add_event(evt)
                             if on_event:
                                 on_event(evt)
-                            yield {"type": "compaction", "trigger": message.trigger}
+
+                elif msg_type == "ResultMessage":
+                    # Final result
+                    result_text = getattr(message, 'result', '') or current_text
+                    subtype = getattr(message, 'subtype', 'success')
+
+                    # Get session_id if available
+                    if hasattr(message, 'session_id'):
+                        session.anthropic_session_id = message.session_id
+
+                    # Create assistant message
+                    assistant_msg = Message(
+                        role=MessageRole.ASSISTANT,
+                        content=result_text,
+                        tool_calls=current_tool_calls,
+                        model=settings.agent.model,
+                    )
+                    session.add_message(assistant_msg)
+                    await self.storage.append_message(session.id, assistant_msg)
+
+                    # Complete session
+                    session.complete(SessionStatus.COMPLETED)
+                    await self.storage.update_session(session)
+
+                    log.info("agent_completed", turns=session.turns)
+
+                    # End Langfuse generation
+                    generation.end(output=result_text)
+
+                    yield {
+                        "type": "done",
+                        "response": result_text,
+                        "session": session,
+                        "turns": session.turns,
+                        "cost_usd": session.usage.cost_usd,
+                    }
 
         except asyncio.CancelledError:
             # Save partial state before raising
