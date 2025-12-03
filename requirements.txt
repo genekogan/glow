@@ -1,5 +1,4 @@
-tensorflow-gpu==1.8.0
-keras==2.2.0
-pillow==5.2.0
-toposort==1.5
-horovod==0.13.8
+anthropic>=0.40.0
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+python-dotenv>=1.0.0

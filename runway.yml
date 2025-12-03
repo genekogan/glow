@@ -1,7 +1,0 @@
-python: 3.6
-cuda: 9.0
-entrypoint: python demo/runway_model.py
-framework: tensorflow
-build_steps:
-  - pip install -r requirements.txt
-  - sh demo/script.sh 
