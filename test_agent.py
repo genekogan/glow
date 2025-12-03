@@ -6,7 +6,7 @@ import os
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
-from agent import run_agent, run_agent_streaming, calculator, web_search
+from agent import run_agent, run_agent_streaming, calculator_handler, web_search_handler
 
 
 # =============================================================================
@@ -15,19 +15,19 @@ from agent import run_agent, run_agent_streaming, calculator, web_search
 
 @pytest.mark.asyncio
 async def test_calculator_add():
-    result = await calculator({"operation": "add", "a": 2, "b": 3})
+    result = await calculator_handler({"operation": "add", "a": 2, "b": 3})
     assert "5" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
 async def test_calculator_multiply():
-    result = await calculator({"operation": "multiply", "a": 7, "b": 8})
+    result = await calculator_handler({"operation": "multiply", "a": 7, "b": 8})
     assert "56" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
 async def test_web_search():
-    result = await web_search({"query": "python async"})
+    result = await web_search_handler({"query": "python async"})
     assert "python async" in result["content"][0]["text"]
 
 

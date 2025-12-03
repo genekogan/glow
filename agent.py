@@ -21,19 +21,22 @@ from claude_agent_sdk import (
 # CUSTOM TOOLS (via MCP)
 # =============================================================================
 
-@tool("calculator", "Perform arithmetic", {"operation": str, "a": float, "b": float})
-async def calculator(args):
+# Tool handlers (plain functions for testability)
+async def calculator_handler(args):
     """A simple calculator tool."""
     op, a, b = args["operation"], args["a"], args["b"]
     result = {"add": a + b, "subtract": a - b, "multiply": a * b, "divide": a / b if b else "error"}[op]
     return {"content": [{"type": "text", "text": f"{a} {op} {b} = {result}"}]}
 
 
-@tool("web_search", "Search the web", {"query": str})
-async def web_search(args):
+async def web_search_handler(args):
     """Mock web search tool."""
     return {"content": [{"type": "text", "text": f"Results for '{args['query']}': [mock results]"}]}
 
+
+# Wrap handlers as SDK tools
+calculator = tool("calculator", "Perform arithmetic", {"operation": str, "a": float, "b": float})(calculator_handler)
+web_search = tool("web_search", "Search the web", {"query": str})(web_search_handler)
 
 # Bundle tools into an MCP server
 custom_tools = create_sdk_mcp_server(
