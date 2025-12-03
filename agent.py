@@ -1,15 +1,14 @@
 """
-Claude Agent SDK - Entry Point
+Claude Agent - Entry Point
 
 Demonstrates the full infrastructure:
-- Custom tools via MCP
+- Custom tools
 - Session management
 - Logging and observability
 - Error handling
 """
 
 import asyncio
-from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from client import AgentClient, create_client, CancellationToken
 from storage import MemoryStorage
@@ -19,31 +18,68 @@ log = get_logger("agent")
 
 
 # =============================================================================
-# CUSTOM TOOLS (via MCP)
+# CUSTOM TOOLS
 # =============================================================================
 
-async def calculator_handler(args):
+# Tool definitions in Anthropic format
+TOOLS = [
+    {
+        "name": "calculator",
+        "description": "Perform basic arithmetic operations",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["add", "subtract", "multiply", "divide"],
+                    "description": "The arithmetic operation to perform"
+                },
+                "a": {"type": "number", "description": "First operand"},
+                "b": {"type": "number", "description": "Second operand"},
+            },
+            "required": ["operation", "a", "b"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the web for information",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+
+# Tool handlers
+async def calculator_handler(args: dict) -> str:
     """A simple calculator tool."""
     op, a, b = args["operation"], args["a"], args["b"]
-    result = {"add": a + b, "subtract": a - b, "multiply": a * b, "divide": a / b if b else "error"}[op]
-    return {"content": [{"type": "text", "text": f"{a} {op} {b} = {result}"}]}
+    if op == "add":
+        result = a + b
+    elif op == "subtract":
+        result = a - b
+    elif op == "multiply":
+        result = a * b
+    elif op == "divide":
+        result = a / b if b != 0 else "error: division by zero"
+    else:
+        result = "error: unknown operation"
+    return f"{a} {op} {b} = {result}"
 
 
-async def web_search_handler(args):
+async def web_search_handler(args: dict) -> str:
     """Mock web search tool."""
-    return {"content": [{"type": "text", "text": f"Results for '{args['query']}': [mock results]"}]}
+    return f"Results for '{args['query']}': [mock search results]"
 
 
-# Wrap handlers as SDK tools
-calculator = tool("calculator", "Perform arithmetic", {"operation": str, "a": float, "b": float})(calculator_handler)
-web_search = tool("web_search", "Search the web", {"query": str})(web_search_handler)
-
-# Bundle tools into an MCP server
-custom_tools = create_sdk_mcp_server(
-    name="custom",
-    version="1.0.0",
-    tools=[calculator, web_search],
-)
+TOOL_HANDLERS = {
+    "calculator": calculator_handler,
+    "web_search": web_search_handler,
+}
 
 
 # =============================================================================
@@ -62,8 +98,8 @@ async def run_agent(
     """
     async with create_client(
         storage=MemoryStorage(),
-        mcp_servers={"custom": custom_tools},
-        allowed_tools=["Read", "Bash", "mcp__custom__calculator", "mcp__custom__web_search"],
+        tools=TOOLS,
+        tool_handlers=TOOL_HANDLERS,
         system_prompt="You are a helpful assistant. Use tools when needed.",
     ) as client:
         session = await client.create_session(user_id=user_id, cwd=cwd)
@@ -78,7 +114,7 @@ async def run_agent(
                 case "tool_start":
                     print(f"\n🔧 Tool: {event['name']}")
                 case "tool_end":
-                    print(f"   ↳ Done")
+                    print(f"   ↳ {event['result']}")
                 case "error":
                     print(f"\n❌ Error: {event['error']}")
                 case "done":
@@ -101,7 +137,8 @@ async def run_agent_streaming(prompt: str, user_id: str | None = None, cwd: str 
     """
     async with create_client(
         storage=MemoryStorage(),
-        mcp_servers={"custom": custom_tools},
+        tools=TOOLS,
+        tool_handlers=TOOL_HANDLERS,
     ) as client:
         session = await client.create_session(user_id=user_id, cwd=cwd)
         async for event in client.run(prompt=prompt, session=session):
@@ -114,10 +151,10 @@ async def run_agent_streaming(prompt: str, user_id: str | None = None, cwd: str 
 
 async def main():
     setup_logging(level="INFO")
-    print("🚀 Claude Agent SDK Demo\n")
+    print("🚀 Claude Agent Demo\n")
 
     result = await run_agent(
-        prompt="What is 42 * 17? Then tell me what files exist in the current directory.",
+        prompt="What is 42 * 17?",
         cwd="/home/user/glow",
     )
 

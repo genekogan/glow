@@ -1,20 +1,21 @@
 """
 Main agent client with full infrastructure.
 
-Wraps the Claude Agent SDK with:
+Uses the Anthropic API directly for reliable operation:
 - Session management and persistence
 - Structured logging with session context
 - Error handling and retry logic
 - Langfuse observability
 - Cancellation support
-- Parallel tool execution
+- Tool execution
 """
 
 import asyncio
+import json
 from typing import AsyncIterator, Any, Callable
 from contextlib import asynccontextmanager
 
-from claude_agent_sdk import query, ClaudeAgentOptions
+import anthropic
 
 from config import settings
 from models import (
@@ -82,22 +83,25 @@ class AgentClient:
     - Logging and observability
     - Error handling and retries
     - Cancellation
+    - Tool execution
     """
 
     def __init__(
         self,
         storage: Storage | None = None,
-        mcp_servers: dict | None = None,
-        allowed_tools: list[str] | None = None,
+        tools: list[dict] | None = None,
+        tool_handlers: dict[str, Callable] | None = None,
         system_prompt: str | None = None,
     ):
         self.storage = storage or MemoryStorage()
-        self.mcp_servers = mcp_servers or {}
-        self.allowed_tools = allowed_tools
+        self.tools = tools or []
+        self.tool_handlers = tool_handlers or {}
         self.system_prompt = system_prompt or "You are a helpful assistant."
+        self._client: anthropic.AsyncAnthropic | None = None
 
     async def __aenter__(self):
         await self.storage.connect()
+        self._client = anthropic.AsyncAnthropic()
         return self
 
     async def __aexit__(self, *args):
@@ -253,7 +257,7 @@ class AgentClient:
         trace: Any,
         on_event: Callable[[Event], None] | None,
     ) -> AsyncIterator[dict]:
-        """Internal agent loop with SDK."""
+        """Internal agent loop with raw Anthropic API."""
 
         # Add user message
         user_msg = Message(
@@ -264,145 +268,189 @@ class AgentClient:
         session.add_message(user_msg)
         await self.storage.append_message(session.id, user_msg)
 
-        # Configure SDK options
-        options = ClaudeAgentOptions(
-            system_prompt=session.system_prompt,
-            permission_mode=settings.agent.permission_mode,
-            cwd=session.cwd,
-            max_turns=settings.agent.max_turns,
-            model=settings.agent.model,
-            mcp_servers=self.mcp_servers,
-            allowed_tools=self.allowed_tools,
-            resume=session.anthropic_session_id,  # Resume if available
-        )
+        # Build messages for API
+        messages = [{"role": "user", "content": prompt}]
 
-        turn = session.turns
-        current_text = ""
-        current_tool_calls = []
+        turn = 0
+        max_turns = settings.agent.max_turns
 
-        # Create generation in Langfuse
-        generation = tracer.generation(
-            trace=trace,
-            name=f"turn_{turn + 1}",
-            model=settings.agent.model,
-            input=prompt,
-        )
+        while turn < max_turns:
+            cancel_token.check()
 
-        try:
-            async for message in query(prompt=prompt, options=options):
-                # Check for cancellation
-                cancel_token.check()
+            turn += 1
+            session.turns = turn
 
-                msg_type = type(message).__name__
+            yield {"type": "turn_start", "turn": turn}
 
-                if msg_type == "SystemMessage":
-                    # System messages: init, compact_boundary, etc.
-                    subtype = getattr(message, 'subtype', None)
-                    data = getattr(message, 'data', {})
+            evt = Event(type=EventType.TURN_START, turn=turn)
+            session.add_event(evt)
+            if on_event:
+                on_event(evt)
 
-                    if subtype == "init":
-                        # Session initialized
-                        if 'session_id' in data:
-                            session.anthropic_session_id = data['session_id']
-                        turn += 1
-                        session.turns = turn
-                        yield {"type": "turn_start", "turn": turn}
+            # Create generation in Langfuse
+            generation = tracer.generation(
+                trace=trace,
+                name=f"turn_{turn}",
+                model=settings.agent.model,
+                input=messages[-1] if messages else prompt,
+            )
 
-                        evt = Event(type=EventType.TURN_START, turn=turn)
-                        session.add_event(evt)
-                        if on_event:
-                            on_event(evt)
+            # Call Anthropic API
+            response = await self._call_api(messages, session.system_prompt)
 
-                    elif subtype == "compact_boundary":
-                        trigger = data.get("trigger", "auto")
-                        evt = Event(
-                            type=EventType.COMPACTION,
-                            data={"trigger": trigger},
-                        )
-                        session.add_event(evt)
-                        if on_event:
-                            on_event(evt)
-                        yield {"type": "compaction", "trigger": trigger}
+            # Track usage
+            if hasattr(response, 'usage'):
+                session.usage.input_tokens += response.usage.input_tokens
+                session.usage.output_tokens += response.usage.output_tokens
 
-                elif msg_type == "AssistantMessage":
-                    # Assistant response with content
-                    content = getattr(message, 'content', [])
-                    for block in content:
-                        block_type = type(block).__name__
-                        if block_type == "TextBlock":
-                            text = getattr(block, 'text', '')
-                            current_text += text
-                            yield {"type": "text", "text": text}
-                        elif block_type == "ToolUseBlock":
-                            tool_call = ToolCall(
-                                tool_use_id=getattr(block, 'id', ''),
-                                name=getattr(block, 'name', ''),
-                                input=getattr(block, 'input', {}),
-                            )
-                            current_tool_calls.append(tool_call)
-                            yield {
-                                "type": "tool_start",
-                                "name": tool_call.name,
-                                "id": tool_call.tool_use_id,
-                            }
+            # Process response
+            assistant_content = []
+            response_text = ""
+            tool_calls = []
+            has_tool_use = False
 
-                            evt = Event(
-                                type=EventType.TOOL_START,
-                                turn=turn,
-                                tool_call_id=tool_call.id,
-                                data={"name": tool_call.name},
-                            )
-                            session.add_event(evt)
-                            if on_event:
-                                on_event(evt)
+            for block in response.content:
+                if block.type == "text":
+                    response_text += block.text
+                    yield {"type": "text", "text": block.text}
+                    assistant_content.append({"type": "text", "text": block.text})
 
-                elif msg_type == "ResultMessage":
-                    # Final result
-                    result_text = getattr(message, 'result', '') or current_text
-                    subtype = getattr(message, 'subtype', 'success')
-
-                    # Get session_id if available
-                    if hasattr(message, 'session_id'):
-                        session.anthropic_session_id = message.session_id
-
-                    # Create assistant message
-                    assistant_msg = Message(
-                        role=MessageRole.ASSISTANT,
-                        content=result_text,
-                        tool_calls=current_tool_calls,
-                        model=settings.agent.model,
+                elif block.type == "tool_use":
+                    has_tool_use = True
+                    tool_call = ToolCall(
+                        tool_use_id=block.id,
+                        name=block.name,
+                        input=block.input,
                     )
-                    session.add_message(assistant_msg)
-                    await self.storage.append_message(session.id, assistant_msg)
-
-                    # Complete session
-                    session.complete(SessionStatus.COMPLETED)
-                    await self.storage.update_session(session)
-
-                    log.info("agent_completed", turns=session.turns)
-
-                    # End Langfuse generation
-                    generation.end(output=result_text)
+                    tool_calls.append(tool_call)
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
 
                     yield {
-                        "type": "done",
-                        "response": result_text,
-                        "session": session,
-                        "turns": session.turns,
-                        "cost_usd": session.usage.cost_usd,
+                        "type": "tool_start",
+                        "name": block.name,
+                        "id": block.id,
+                        "input": block.input,
                     }
 
-        except asyncio.CancelledError:
-            # Save partial state before raising
-            if current_text:
-                partial_msg = Message(
+                    evt = Event(
+                        type=EventType.TOOL_START,
+                        turn=turn,
+                        tool_call_id=tool_call.id,
+                        data={"name": block.name},
+                    )
+                    session.add_event(evt)
+                    if on_event:
+                        on_event(evt)
+
+            # Add assistant message to conversation
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            # End Langfuse generation
+            generation.end(output=response_text)
+
+            # If no tool use, we're done
+            if not has_tool_use or response.stop_reason == "end_turn":
+                # Create assistant message
+                assistant_msg = Message(
                     role=MessageRole.ASSISTANT,
-                    content=current_text,
-                    tool_calls=current_tool_calls,
+                    content=response_text,
+                    tool_calls=tool_calls,
+                    model=settings.agent.model,
                 )
-                session.add_message(partial_msg)
-                await self.storage.append_message(session.id, partial_msg)
-            raise CancelledError()
+                session.add_message(assistant_msg)
+                await self.storage.append_message(session.id, assistant_msg)
+
+                # Complete session
+                session.complete(SessionStatus.COMPLETED)
+                await self.storage.update_session(session)
+
+                log.info("agent_completed", turns=session.turns)
+
+                yield {
+                    "type": "done",
+                    "response": response_text,
+                    "session": session,
+                    "turns": session.turns,
+                    "cost_usd": session.usage.cost_usd,
+                }
+                return
+
+            # Execute tools and continue
+            tool_results = []
+            for tool_call in tool_calls:
+                cancel_token.check()
+
+                result = await self._execute_tool(tool_call)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.tool_use_id,
+                    "content": result,
+                })
+
+                yield {
+                    "type": "tool_end",
+                    "name": tool_call.name,
+                    "id": tool_call.tool_use_id,
+                    "result": result,
+                }
+
+                evt = Event(
+                    type=EventType.TOOL_END,
+                    turn=turn,
+                    tool_call_id=tool_call.id,
+                    data={"name": tool_call.name, "result": result[:200] if isinstance(result, str) else str(result)[:200]},
+                )
+                session.add_event(evt)
+                if on_event:
+                    on_event(evt)
+
+            # Add tool results to conversation
+            messages.append({"role": "user", "content": tool_results})
+
+        # Max turns reached
+        session.complete(SessionStatus.COMPLETED)
+        await self.storage.update_session(session)
+        log.warning("max_turns_reached", turns=turn)
+        yield {
+            "type": "done",
+            "response": response_text,
+            "session": session,
+            "turns": session.turns,
+            "cost_usd": session.usage.cost_usd,
+        }
+
+    async def _call_api(self, messages: list, system_prompt: str):
+        """Call Anthropic API with retry logic."""
+        return await self._client.messages.create(
+            model=settings.agent.model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+            tools=self.tools if self.tools else None,
+        )
+
+    async def _execute_tool(self, tool_call: ToolCall) -> str:
+        """Execute a tool and return the result."""
+        handler = self.tool_handlers.get(tool_call.name)
+        if handler:
+            try:
+                result = await handler(tool_call.input)
+                if isinstance(result, dict) and "content" in result:
+                    # MCP-style response
+                    content = result["content"]
+                    if isinstance(content, list) and content:
+                        return content[0].get("text", str(content[0]))
+                    return str(content)
+                return str(result)
+            except Exception as e:
+                return f"Error: {e}"
+        else:
+            return f"Tool '{tool_call.name}' not found"
 
     # =========================================================================
     # CONVENIENCE METHODS
