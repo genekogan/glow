@@ -1,0 +1,20 @@
+# Glow Agent Configuration
+
+retry:
+  max_attempts: 5
+  initial_delay: 2.0      # seconds
+  max_delay: 60.0         # seconds
+  exponential_base: 2.0
+  retry_on_500: true
+  retry_on_overloaded: true
+  retry_on_rate_limit: true
+
+timeout:
+  turn_timeout: 300.0     # 5 minutes per turn
+  tool_timeout: 120.0     # 2 minutes per tool
+  session_timeout: 3600.0 # 1 hour total session
+
+agent:
+  model: "claude-sonnet-4-20250514"
+  max_turns: 50
+  permission_mode: "acceptEdits"
